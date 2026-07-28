@@ -1,0 +1,2 @@
+[console_scripts]
+on-call-handover = on_call_handover.cli:main
