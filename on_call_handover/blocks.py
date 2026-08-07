@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 logger = logging.getLogger(__name__)
 
 HEADING_TYPES = {"heading_1", "heading_2", "heading_3"}
+INCIDENT_TITLE_MAX_LENGTH = 60
 COPYABLE_BLOCK_TYPES = {
     "to_do",
     "bulleted_list_item",
@@ -71,6 +72,33 @@ def is_empty_placeholder(block: dict[str, Any]) -> bool:
     return not block_plain_text(block).strip() and not block.get("has_children")
 
 
+def section_has_child_database(blocks: list[dict[str, Any]]) -> bool:
+    return any(block.get("type") == "child_database" for block in blocks)
+
+
+def child_databases_between_headings(
+    blocks: list[dict[str, Any]],
+    start_heading: str,
+    end_heading: str,
+) -> list[dict[str, Any]]:
+    start_id = find_heading_id(blocks, start_heading)
+    end_id = find_heading_id(blocks, end_heading)
+    if not start_id or not end_id:
+        return []
+
+    databases: list[dict[str, Any]] = []
+    started = False
+    for block in blocks:
+        if block["id"] == start_id:
+            started = True
+            continue
+        if block["id"] == end_id:
+            break
+        if started and block.get("type") == "child_database":
+            databases.append(block)
+    return databases
+
+
 def clone_rich_text(
     rich_text: list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]]:
@@ -128,7 +156,10 @@ def clone_block(
     return {"object": "block", "type": block_type, block_type: body}
 
 
-def condense_incident_title(title: str, max_length: int = 100) -> str:
+def condense_incident_title(
+    title: str,
+    max_length: int = INCIDENT_TITLE_MAX_LENGTH,
+) -> str:
     text = " ".join(title.split())
     alert_name = ""
     detail = text
@@ -145,6 +176,24 @@ def condense_incident_title(title: str, max_length: int = 100) -> str:
     if len(condensed) > max_length:
         condensed = condensed[: max_length - 1].rstrip() + "…"
     return condensed or "(untitled)"
+
+
+def incident_duration_minutes(
+    incident: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> int | None:
+    created_at = incident.get("created_at")
+    if not created_at:
+        return None
+
+    start = _parse_datetime(created_at)
+    end = (
+        _parse_datetime(incident["resolved_at"])
+        if incident.get("resolved_at")
+        else now or datetime.now(UTC)
+    )
+    return max(0, int((end - start).total_seconds()) // 60)
 
 
 def incident_duration(
@@ -170,6 +219,54 @@ def incident_duration(
     if minutes:
         return f"{minutes}m"
     return "<1m" if total_seconds else "0m"
+
+
+def incident_notion_properties(
+    incident: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    title = incident.get("title") or incident.get("summary") or "(untitled)"
+    properties: dict[str, Any] = {
+        "Name": {
+            "title": [
+                {
+                    "type": "text",
+                    "text": {"content": condense_incident_title(title)},
+                }
+            ]
+        },
+        "Status": {
+            "status": {
+                "name": "Resolved" if incident.get("resolved_at") else "Open",
+            }
+        },
+    }
+
+    incident_id = incident.get("id")
+    if incident_id:
+        properties["Incident ID"] = {
+            "rich_text": [{"type": "text", "text": {"content": str(incident_id)}}]
+        }
+
+    if incident.get("html_url"):
+        properties["URL"] = {"url": incident["html_url"]}
+
+    if incident.get("created_at"):
+        created = _parse_datetime(incident["created_at"])
+        properties["Created"] = {"date": {"start": created.isoformat()}}
+
+    duration_minutes = incident_duration_minutes(incident, now=now)
+    if duration_minutes is not None:
+        properties["Duration (minutes)"] = {"number": duration_minutes}
+
+    duration = incident_duration(incident, now=now)
+    if duration:
+        properties["Duration"] = {
+            "rich_text": [{"type": "text", "text": {"content": duration}}]
+        }
+
+    return properties
 
 
 def incident_bullet(
@@ -215,6 +312,14 @@ def no_incidents_bullet() -> dict[str, Any]:
         "bulleted_list_item": {
             "rich_text": [_plain_text("No high-urgency incidents in the past week.")]
         },
+    }
+
+
+def empty_paragraph() -> dict[str, Any]:
+    return {
+        "object": "block",
+        "type": "paragraph",
+        "paragraph": {"rich_text": []},
     }
 
 

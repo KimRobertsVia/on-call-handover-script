@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -7,11 +7,12 @@ from on_call_handover.service import HandoverService
 
 
 class FakePagerDuty:
-    def __init__(self) -> None:
+    def __init__(self, incidents: list[dict[str, Any]] | None = None) -> None:
         self.primary_calls = 0
+        self.incidents = incidents or []
 
     def high_urgency_incidents(self, since: datetime, until: datetime) -> list[dict]:
-        return []
+        return self.incidents
 
     def primary_oncall(self, **kwargs: Any) -> dict[str, str]:
         self.primary_calls += 1
@@ -19,19 +20,38 @@ class FakePagerDuty:
 
 
 class FakeNotion:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        existing_page: dict[str, str] | None = None,
+        destination_blocks: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.appended: list[dict[str, Any]] = []
         self.deleted: list[str] = []
+        self.upserted: list[dict[str, Any]] = []
+        self.linked_views: list[dict[str, Any]] = []
+        self.created_pages = 0
+        self.templates_applied = 0
+        self.existing_page = existing_page
+        self._destination_blocks = destination_blocks
 
     def acting_user(self) -> dict[str, str]:
         return {"id": "actor", "name": "Actor"}
 
+    def page_by_date(
+        self,
+        data_source_id: str,
+        handover_date: date,
+    ) -> dict[str, str] | None:
+        return self.existing_page
+
     def create_page(self, **kwargs: Any) -> dict[str, str]:
         assert kwargs["now_primary_user_id"] is None
+        self.created_pages += 1
         return {"id": "destination", "url": "https://notion.test/destination"}
 
     def apply_template(self, page_id: str, **kwargs: Any) -> None:
-        pass
+        self.templates_applied += 1
 
     def block_children(self, block_id: str) -> list[dict[str, Any]]:
         if block_id == "source-page":
@@ -41,16 +61,26 @@ class FakeNotion:
                 _heading("source-actions", "Actions"),
                 _paragraph("new-action", "Investigate"),
             ]
+        if self._destination_blocks is not None:
+            return self._destination_blocks
         return [
+            _heading("announcements", "Announcements"),
+            _heading("outages", "🔥 Outages"),
+            _paragraph("outage-bullet", ""),
             _heading("alerts", "Alerts"),
             _paragraph("alert-placeholder", ""),
+            _heading("low", "😴 Low Urgency Paging Events"),
             _heading("previous", "Previous"),
             _paragraph("previous-placeholder", ""),
             _heading("actions", "Actions"),
         ]
 
-    def append_blocks(self, page_id: str, **kwargs: Any) -> None:
+    def append_blocks(self, page_id: str, **kwargs: Any) -> str:
         self.appended.append({"page_id": page_id, **kwargs})
+        children = kwargs.get("children") or []
+        if children:
+            return f"appended-{len(self.appended)}"
+        return kwargs["after_block_id"]
 
     def delete_block(self, block_id: str) -> None:
         self.deleted.append(block_id)
@@ -58,35 +88,158 @@ class FakeNotion:
     def latest_page(self, data_source_id: str, **kwargs: Any) -> dict[str, str]:
         return {"id": "source-page"}
 
+    def upsert_incident_page(
+        self,
+        data_source_id: str,
+        *,
+        incident_id: str,
+        properties: dict[str, Any],
+    ) -> dict[str, str]:
+        self.upserted.append(
+            {
+                "data_source_id": data_source_id,
+                "incident_id": incident_id,
+                "properties": properties,
+            }
+        )
+        return {"id": f"incident-{incident_id}"}
 
-def test_run_skips_primary_lookup_when_feature_is_disabled(tmp_path: Path) -> None:
-    pagerduty = FakePagerDuty()
-    notion = FakeNotion()
-    config = Config(
+    def create_incidents_linked_view(self, **kwargs: Any) -> dict[str, str]:
+        self.linked_views.append(kwargs)
+        return {"id": "view"}
+
+
+def _config(tmp_path: Path) -> Config:
+    return Config(
         pagerduty_token="pd",
         notion_token="notion",
         notion_data_source_id="target",
         notion_template_id="template",
+        notion_incidents_data_source_id="incidents",
         pagerduty_primary_schedule_id="schedule",
         notion_alerts_heading="Alerts",
+        notion_outages_heading="🔥 Outages",
+        notion_low_urgency_heading="😴 Low Urgency Paging Events",
         notion_previous_actions_heading="Previous",
         notion_actions_heading="Actions",
         mention_now_primary=False,
         user_map_path=tmp_path / "user_map.json",
     )
 
+
+def test_run_creates_page_when_none_exists_for_date(tmp_path: Path) -> None:
+    pagerduty = FakePagerDuty()
+    notion = FakeNotion()
+
     result = HandoverService(
-        config,
+        _config(tmp_path),
         pagerduty=pagerduty,  # type: ignore[arg-type]
         notion=notion,  # type: ignore[arg-type]
         template_poll_interval=0,
     ).run(now=datetime(2026, 7, 27, 9, tzinfo=UTC))
 
     assert pagerduty.primary_calls == 0
+    assert result.created is True
     assert result.incident_count == 0
     assert result.copied_action_count == 2
+    assert notion.created_pages == 1
+    assert notion.templates_applied == 1
     assert notion.deleted == ["alert-placeholder", "previous-placeholder"]
     assert len(notion.appended) == 2
+    assert notion.appended[0]["children"][0]["type"] == "bulleted_list_item"
+    assert notion.upserted == []
+    assert notion.linked_views == []
+
+
+def test_run_upserts_incidents_and_creates_linked_view(tmp_path: Path) -> None:
+    pagerduty = FakePagerDuty(
+        [
+            {
+                "id": "P123",
+                "title": "Alert exploded",
+                "created_at": "2026-07-22T10:00:00Z",
+                "resolved_at": "2026-07-22T11:12:00Z",
+                "html_url": "https://example.test/P123",
+            }
+        ]
+    )
+    notion = FakeNotion()
+
+    result = HandoverService(
+        _config(tmp_path),
+        pagerduty=pagerduty,  # type: ignore[arg-type]
+        notion=notion,  # type: ignore[arg-type]
+        template_poll_interval=0,
+    ).run(now=datetime(2026, 7, 27, 9, tzinfo=UTC))
+
+    assert result.created is True
+    assert result.incident_count == 1
+    assert len(notion.upserted) == 1
+    assert notion.upserted[0]["incident_id"] == "P123"
+    assert notion.upserted[0]["data_source_id"] == "incidents"
+    assert (
+        notion.upserted[0]["properties"]["Duration"]["rich_text"][0]["text"]["content"]
+        == "1h 12m"
+    )
+    assert len(notion.linked_views) == 1
+    assert notion.linked_views[0]["page_id"] == "destination"
+    assert notion.linked_views[0]["after_block_id"] == "alerts"
+    assert notion.linked_views[0]["data_source_id"] == "incidents"
+    assert notion.linked_views[0]["since"].isoformat() == "2026-07-20T12:00:00+01:00"
+    assert notion.linked_views[0]["until"].isoformat() == "2026-07-27T12:00:00+01:00"
+    assert notion.linked_views[0]["title"] == "Alerts"
+    assert notion.appended[0]["after_block_id"] == "outage-bullet"
+    assert notion.appended[0]["children"][0]["type"] == "paragraph"
+    assert "alerts" in notion.deleted
+
+
+def test_run_updates_existing_page_without_recreating_view(tmp_path: Path) -> None:
+    pagerduty = FakePagerDuty(
+        [
+            {
+                "id": "P123",
+                "title": "Alert exploded",
+                "created_at": "2026-07-22T10:00:00Z",
+                "resolved_at": "2026-07-22T11:12:00Z",
+                "html_url": "https://example.test/P123",
+            }
+        ]
+    )
+    notion = FakeNotion(
+        existing_page={
+            "id": "existing",
+            "url": "https://notion.test/existing",
+        },
+        destination_blocks=[
+            _heading("alerts", "Alerts"),
+            {
+                "id": "alerts-view",
+                "type": "child_database",
+                "child_database": {"title": "Incidents"},
+            },
+            _heading("previous", "Previous"),
+            _paragraph("stale-action", "Old copy"),
+            _heading("actions", "Actions"),
+        ],
+    )
+
+    result = HandoverService(
+        _config(tmp_path),
+        pagerduty=pagerduty,  # type: ignore[arg-type]
+        notion=notion,  # type: ignore[arg-type]
+        template_poll_interval=0,
+    ).run(now=datetime(2026, 7, 27, 9, tzinfo=UTC))
+
+    assert result.created is False
+    assert result.page_url == "https://notion.test/existing"
+    assert notion.created_pages == 0
+    assert notion.templates_applied == 0
+    assert len(notion.upserted) == 1
+    assert notion.linked_views == []
+    assert notion.deleted == ["stale-action"]
+    assert len(notion.appended) == 1
+    assert notion.appended[0]["after_block_id"] == "previous"
+    assert result.copied_action_count == 2
 
 
 def _heading(block_id: str, text: str) -> dict[str, Any]:

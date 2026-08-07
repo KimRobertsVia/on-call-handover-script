@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 import requests
@@ -9,6 +9,21 @@ import requests
 NOTION_BASE_URL = "https://api.notion.com/v1"
 NOTION_VERSION = "2025-09-03"
 PAGE_SIZE = 100
+
+INCIDENT_VIEW_VISIBLE = ("Name", "Created", "Duration")
+INCIDENT_VIEW_HIDDEN = (
+    "URL",
+    "Duration (minutes)",
+    "Status",
+    "Incident ID",
+)
+INCIDENT_VIEW_WIDTHS = {
+    "Name": 520,
+    "Created": 240,
+    "Duration": 100,
+}
+DURATION_VIEW_NAME = "By duration"
+CHRONOLOGICAL_VIEW_NAME = "Chronological"
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +43,7 @@ class NotionClient:
             "Notion-Version": NOTION_VERSION,
             "Content-Type": "application/json",
         }
+        self._property_ids_by_data_source: dict[str, dict[str, str]] = {}
 
     def acting_user(self) -> dict[str, str]:
         user = self._request("GET", "/users/me")
@@ -73,13 +89,28 @@ class NotionClient:
         *,
         page_size: int = PAGE_SIZE,
     ) -> list[dict[str, Any]]:
+        return self.query_data_source(
+            data_source_id,
+            sorts=[{"property": "Date", "direction": "descending"}],
+            page_size=page_size,
+        )
+
+    def query_data_source(
+        self,
+        data_source_id: str,
+        *,
+        filter: dict[str, Any] | None = None,
+        sorts: list[dict[str, Any]] | None = None,
+        page_size: int = PAGE_SIZE,
+    ) -> list[dict[str, Any]]:
         pages: list[dict[str, Any]] = []
         cursor: str | None = None
         while True:
-            body: dict[str, Any] = {
-                "sorts": [{"property": "Date", "direction": "descending"}],
-                "page_size": page_size,
-            }
+            body: dict[str, Any] = {"page_size": page_size}
+            if filter:
+                body["filter"] = filter
+            if sorts:
+                body["sorts"] = sorts
             if cursor:
                 body["start_cursor"] = cursor
             payload = self._request(
@@ -112,6 +143,22 @@ class NotionClient:
             return page
         return None
 
+    def page_by_date(
+        self,
+        data_source_id: str,
+        handover_date: date,
+    ) -> dict[str, Any] | None:
+        pages = self.query_data_source(
+            data_source_id,
+            filter={
+                "property": "Date",
+                "date": {"equals": handover_date.isoformat()},
+            },
+            sorts=[{"property": "Date", "direction": "descending"}],
+            page_size=1,
+        )
+        return pages[0] if pages else None
+
     def create_page(
         self,
         *,
@@ -132,6 +179,13 @@ class NotionClient:
         if now_primary_user_id:
             properties["Now Primary"] = {"people": [{"id": now_primary_user_id}]}
 
+        return self.create_data_source_page(data_source_id, properties)
+
+    def create_data_source_page(
+        self,
+        data_source_id: str,
+        properties: dict[str, Any],
+    ) -> dict[str, Any]:
         return self._request(
             "POST",
             "/pages",
@@ -143,6 +197,174 @@ class NotionClient:
                 "properties": properties,
             },
         )
+
+    def update_page_properties(
+        self,
+        page_id: str,
+        properties: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self._request(
+            "PATCH",
+            f"/pages/{page_id}",
+            json={"properties": properties},
+        )
+
+    def upsert_incident_page(
+        self,
+        data_source_id: str,
+        *,
+        incident_id: str,
+        properties: dict[str, Any],
+    ) -> dict[str, Any]:
+        existing = self.query_data_source(
+            data_source_id,
+            filter={
+                "property": "Incident ID",
+                "rich_text": {"equals": incident_id},
+            },
+            page_size=1,
+        )
+        if existing:
+            return self.update_page_properties(existing[0]["id"], properties)
+        return self.create_data_source_page(data_source_id, properties)
+
+    def property_ids(self, data_source_id: str) -> dict[str, str]:
+        cached = self._property_ids_by_data_source.get(data_source_id)
+        if cached is not None:
+            return cached
+
+        payload = self._request("GET", f"/data_sources/{data_source_id}")
+        mapping = {
+            name: prop["id"]
+            for name, prop in (payload.get("properties") or {}).items()
+            if prop.get("id")
+        }
+        self._property_ids_by_data_source[data_source_id] = mapping
+        return mapping
+
+    def create_incidents_linked_view(
+        self,
+        *,
+        page_id: str,
+        after_block_id: str,
+        data_source_id: str,
+        since: datetime,
+        until: datetime,
+        title: str,
+    ) -> dict[str, Any]:
+        properties_config = self._incident_view_properties(data_source_id)
+        week_filter = {
+            "and": [
+                {
+                    "property": "Created",
+                    "date": {"on_or_after": since.isoformat()},
+                },
+                {
+                    "property": "Created",
+                    "date": {"before": until.isoformat()},
+                },
+            ]
+        }
+        duration_view = self._request(
+            "POST",
+            "/views",
+            json={
+                "data_source_id": data_source_id,
+                "name": DURATION_VIEW_NAME,
+                "type": "table",
+                "filter": week_filter,
+                "sorts": [
+                    {
+                        "property": "Duration (minutes)",
+                        "direction": "descending",
+                    }
+                ],
+                "configuration": {
+                    "type": "table",
+                    "wrap_cells": True,
+                    "properties": properties_config,
+                },
+                "create_database": {
+                    "parent": {"type": "page_id", "page_id": page_id},
+                    "position": {
+                        "type": "after_block",
+                        "block_id": after_block_id,
+                    },
+                },
+            },
+        )
+        linked_database_id = (duration_view.get("parent") or {}).get("database_id")
+        if not linked_database_id:
+            raise RuntimeError(
+                "Linked incidents view did not return a parent database_id"
+            )
+
+        chronological_view = self._request(
+            "POST",
+            "/views",
+            json={
+                "database_id": linked_database_id,
+                "data_source_id": data_source_id,
+                "name": CHRONOLOGICAL_VIEW_NAME,
+                "type": "table",
+                "filter": week_filter,
+                "sorts": [
+                    {
+                        "property": "Created",
+                        "direction": "descending",
+                    }
+                ],
+                "configuration": {
+                    "type": "table",
+                    "wrap_cells": True,
+                    "properties": properties_config,
+                },
+                "position": {"type": "end"},
+            },
+        )
+        self.set_database_title(linked_database_id, title)
+        return {
+            "database_id": linked_database_id,
+            "duration_view": duration_view,
+            "chronological_view": chronological_view,
+        }
+
+    def set_database_title(self, database_id: str, title: str) -> dict[str, Any]:
+        return self._request(
+            "PATCH",
+            f"/databases/{database_id}",
+            json={
+                "title": [
+                    {
+                        "type": "text",
+                        "text": {"content": title},
+                    }
+                ]
+            },
+        )
+
+    def _incident_view_properties(
+        self,
+        data_source_id: str,
+    ) -> list[dict[str, Any]]:
+        property_ids = self.property_ids(data_source_id)
+        properties_config: list[dict[str, Any]] = []
+        for property_name in (*INCIDENT_VIEW_VISIBLE, *INCIDENT_VIEW_HIDDEN):
+            property_id = property_ids.get(property_name)
+            if not property_id:
+                raise RuntimeError(
+                    f"Incidents data source is missing property {property_name!r}"
+                )
+            entry: dict[str, Any] = {
+                "property_id": property_id,
+                "property_name": property_name,
+                "visible": property_name in INCIDENT_VIEW_VISIBLE,
+                "width": INCIDENT_VIEW_WIDTHS.get(property_name, 160),
+            }
+            if property_name == "Name":
+                entry["wrap"] = True
+            properties_config.append(entry)
+        return properties_config
 
     def apply_template(
         self,
@@ -187,7 +409,7 @@ class NotionClient:
         *,
         after_block_id: str,
         children: list[dict[str, Any]],
-    ) -> None:
+    ) -> str:
         after = after_block_id
         for start in range(0, len(children), PAGE_SIZE):
             payload = self._request(
@@ -205,6 +427,7 @@ class NotionClient:
             results = payload.get("results") or []
             if results:
                 after = results[-1]["id"]
+        return after
 
     def delete_block(self, block_id: str) -> None:
         self._request("DELETE", f"/blocks/{block_id}")

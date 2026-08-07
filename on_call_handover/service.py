@@ -8,13 +8,15 @@ from datetime import time as datetime_time
 from typing import Any
 
 from .blocks import (
+    child_databases_between_headings,
     clone_block,
+    empty_paragraph,
     find_heading_id,
-    incident_bullet,
-    is_empty_placeholder,
+    incident_notion_properties,
     no_incidents_bullet,
     section_after_heading,
     section_by_heading,
+    section_has_child_database,
 )
 from .config import Config
 from .notion import NotionClient
@@ -30,6 +32,7 @@ class HandoverResult:
     page_url: str
     incident_count: int
     copied_action_count: int
+    created: bool
 
 
 class HandoverService:
@@ -61,33 +64,51 @@ class HandoverService:
         incidents = self._pagerduty.high_urgency_incidents(since, until)
         logger.info("Found %d high-urgency incidents", len(incidents))
 
-        primary_user_id = self._resolve_primary_user_id(handover_date)
-        actor = self._notion.acting_user()
-        title = f"On-call Handover {handover_date.isoformat()}"
-        page = self._notion.create_page(
-            data_source_id=self._config.notion_data_source_id,
-            title_property=self._config.notion_title_property,
-            title=title,
-            handover_date=handover_date,
-            created_by_user_id=actor["id"],
-            now_primary_user_id=primary_user_id,
+        existing = self._notion.page_by_date(
+            self._config.notion_data_source_id,
+            handover_date,
         )
-        page_id = page["id"]
-        page_url = page.get("url") or page_id
+        if existing:
+            page_id = existing["id"]
+            page_url = existing.get("url") or page_id
+            created = False
+            logger.info("Updating existing handover page %s", page_id)
+            blocks = self._notion.block_children(page_id)
+        else:
+            primary_user_id = self._resolve_primary_user_id(handover_date)
+            actor = self._notion.acting_user()
+            title = f"On-call Handover {handover_date.isoformat()}"
+            page = self._notion.create_page(
+                data_source_id=self._config.notion_data_source_id,
+                title_property=self._config.notion_title_property,
+                title=title,
+                handover_date=handover_date,
+                created_by_user_id=actor["id"],
+                now_primary_user_id=primary_user_id,
+            )
+            page_id = page["id"]
+            page_url = page.get("url") or page_id
+            created = True
+            logger.info("Created handover page %s", page_id)
+            self._notion.apply_template(
+                page_id,
+                template_id=self._config.notion_template_id,
+                timezone_name=self._config.notion_timezone,
+            )
+            blocks = self._wait_for_template(page_id)
 
-        self._notion.apply_template(
+        self._populate_incidents(
             page_id,
-            template_id=self._config.notion_template_id,
-            timezone_name=self._config.notion_timezone,
+            blocks,
+            incidents,
+            since=since,
+            until=until,
         )
-        blocks = self._wait_for_template(page_id)
-        self._populate_incidents(page_id, blocks, incidents)
-
         copied_count = self._copy_previous_actions(
             destination_page_id=page_id,
             destination_blocks=self._notion.block_children(page_id),
         )
-        return HandoverResult(page_url, len(incidents), copied_count)
+        return HandoverResult(page_url, len(incidents), copied_count, created)
 
     def _resolve_primary_user_id(self, handover_date: date) -> str | None:
         if not self._config.mention_now_primary:
@@ -147,22 +168,103 @@ class HandoverService:
         page_id: str,
         blocks: list[dict[str, Any]],
         incidents: list[dict[str, Any]],
+        *,
+        since: datetime,
+        until: datetime,
     ) -> None:
         heading_id = find_heading_id(blocks, self._config.notion_alerts_heading)
+        linked_databases = child_databases_between_headings(
+            blocks,
+            self._config.notion_outages_heading,
+            self._config.notion_low_urgency_heading,
+        )
+        has_view = bool(linked_databases) or (
+            bool(heading_id)
+            and section_has_child_database(section_after_heading(blocks, heading_id))
+        )
+
+        for incident in incidents:
+            incident_id = incident.get("id")
+            if not incident_id:
+                logger.warning(
+                    "Skipping incident without id: %s",
+                    incident.get("title"),
+                )
+                continue
+            self._notion.upsert_incident_page(
+                self._config.notion_incidents_data_source_id,
+                incident_id=str(incident_id),
+                properties=incident_notion_properties(incident),
+            )
+
+        if not incidents:
+            if has_view:
+                logger.info(
+                    "No incidents; leaving existing linked view under %s",
+                    self._config.notion_alerts_heading,
+                )
+                return
+            if not heading_id:
+                raise RuntimeError(
+                    f"Missing heading {self._config.notion_alerts_heading!r}"
+                )
+            self._clear_section(blocks, heading_id)
+            self._notion.append_blocks(
+                page_id,
+                after_block_id=heading_id,
+                children=[no_incidents_bullet()],
+            )
+            return
+
+        if has_view:
+            logger.info(
+                "Upserted %d incidents; existing linked view will refresh",
+                len(incidents),
+            )
+            return
+
         if not heading_id:
             raise RuntimeError(
                 f"Missing heading {self._config.notion_alerts_heading!r}"
             )
-        self._clear_placeholders(blocks, heading_id)
-        children = (
-            [incident_bullet(item, self._config.timezone) for item in incidents]
-            if incidents
-            else [no_incidents_bullet()]
+
+        self._clear_section(blocks, heading_id)
+
+        # Spacer must be inserted before the alerts heading (after Outages
+        # content). Positioning a linked DB after a just-created block is
+        # unreliable and can append it at the end of the page instead.
+        outages_section = section_by_heading(
+            blocks,
+            self._config.notion_outages_heading,
         )
+        spacer_after_id = (
+            outages_section[-1]["id"]
+            if outages_section
+            else find_heading_id(blocks, self._config.notion_outages_heading)
+        )
+        if not spacer_after_id:
+            raise RuntimeError(
+                f"Missing heading {self._config.notion_outages_heading!r}"
+            )
         self._notion.append_blocks(
             page_id,
+            after_block_id=spacer_after_id,
+            children=[empty_paragraph()],
+        )
+        self._notion.create_incidents_linked_view(
+            page_id=page_id,
             after_block_id=heading_id,
-            children=children,
+            data_source_id=self._config.notion_incidents_data_source_id,
+            since=since,
+            until=until,
+            title=self._config.notion_alerts_heading,
+        )
+        # Linked DBs always show a title; remove the heading to avoid duplicates.
+        self._notion.delete_block(heading_id)
+        logger.info(
+            "Upserted %d incidents and added duration + chronological views as %s",
+            len(incidents),
+            self._config.notion_alerts_heading,
         )
 
     def _copy_previous_actions(
@@ -206,20 +308,19 @@ class HandoverService:
                 "Destination page is missing heading "
                 f"{self._config.notion_previous_actions_heading!r}"
             )
-        self._clear_placeholders(destination_blocks, heading_id)
+        self._clear_section(destination_blocks, heading_id)
         self._notion.append_blocks(
             destination_page_id,
             after_block_id=heading_id,
             children=copied,
         )
-        logger.info("Copied %d action blocks", len(copied))
+        logger.info("Replaced previous actions with %d blocks", len(copied))
         return len(copied)
 
-    def _clear_placeholders(
+    def _clear_section(
         self,
         blocks: list[dict[str, Any]],
         heading_id: str,
     ) -> None:
         for block in section_after_heading(blocks, heading_id):
-            if is_empty_placeholder(block):
-                self._notion.delete_block(block["id"])
+            self._notion.delete_block(block["id"])

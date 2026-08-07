@@ -26,7 +26,8 @@ def main() -> int:
         return 1
 
     logger.info(
-        "Created handover with %d incidents and %d copied actions: %s",
+        "%s handover with %d incidents and %d copied actions: %s",
+        "Created" if result.created else "Updated",
         result.incident_count,
         result.copied_action_count,
         result.page_url,

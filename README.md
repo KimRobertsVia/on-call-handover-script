@@ -12,12 +12,20 @@ For the current or upcoming Monday, the command:
 2. Optionally resolves the scheduled primary on-call person to a Notion user.
 3. Creates a Notion page with its title, date, creator, and optional primary.
 4. Applies the configured Notion template and validates its expected headings.
-5. Adds linked incident bullets with local timestamps and durations.
-6. Copies unfinished content from both **Previous actions** and **Actions** on
-   the latest prior handover into **Previous actions** on the new page.
+5. Upserts each incident into the shared high-urgency incidents data source and
+   inserts a linked database under **High Urgency Paging** with **By duration**
+   and **Chronological** views for that week (skipped if the page already has
+   a linked view).
+6. Replaces **Previous actions** with content from both **Previous actions** and
+   **Actions** on the latest prior handover.
 
-PagerDuty access is read-only. Notion access creates and populates the new page
-and removes empty placeholders from that page.
+If a handover page already exists for that Monday `Date`, the command updates it
+instead of creating another page. Template application and page properties are
+left alone on update; incident rows refresh via upsert and the existing linked
+view reflects them automatically.
+
+PagerDuty access is read-only. Notion access creates and populates the new page,
+writes incident rows, and removes empty placeholders from that page.
 
 ## Setup
 
@@ -58,11 +66,17 @@ These values are already set in `.env.example` and usually do not need changing:
 - `PAGERDUTY_PRIMARY_SCHEDULE_ID`: schedule used for **Now Primary**.
 - `NOTION_DATA_SOURCE_ID`: handover data source used to create pages and find
   the previous handover.
+- `NOTION_INCIDENTS_DATA_SOURCE_ID`: shared high-urgency incidents data source
+  used for incident rows and per-page linked views.
 - `NOTION_TEMPLATE_ID`: template applied to the new page.
 - `NOTION_TITLE_PROPERTY`: title property, default `Title`.
 - `NOTION_TIMEZONE`: IANA timezone, default `Europe/London`.
 - `MENTION_NOW_PRIMARY`: enables primary-user resolution when set to `1`,
   `true`, or `yes`; default `false`.
+
+During development, point `NOTION_DATA_SOURCE_ID` and
+`NOTION_INCIDENTS_DATA_SOURCE_ID` at the test databases (Oncall handover test /
+High urgency events test) before switching back to production ids.
 
 API tokens belong only in `.env`. Template headings are defined in
 `on_call_handover/config.py` as part of the code-level template contract:
@@ -101,7 +115,9 @@ API failures, template timeouts, or workflow errors.
 
 ## Notion schema
 
-The data source must contain:
+### Handover pages
+
+The handover data source must contain:
 
 - `Title` as a title property, or the name configured by
   `NOTION_TITLE_PROPERTY`.
@@ -115,6 +131,28 @@ resolving a primary user by email.
 The template is applied after page creation using `erase_content=true`. This is
 intentional: applying it in the create request can produce a blank page in the
 current workspace.
+
+Do not put the high-urgency linked view in the template. Each run creates a view
+with absolute `Created` bounds for that Monday–Monday window so historical pages
+keep the correct week when reopened later. After inserting the linked database,
+the script removes the template **High Urgency Paging** heading and titles the
+linked database instead, with a blank paragraph above it for spacing. After inserting the linked database,
+the script removes the template **High Urgency Paging** heading and uses the
+linked database title instead, so the section is not labeled twice.
+
+### High-urgency incidents
+
+The incidents data source (`NOTION_INCIDENTS_DATA_SOURCE_ID`) must contain:
+
+- `Name` (title)
+- `URL` (url)
+- `Created` (date with time)
+- `Duration (minutes)` (number) — sort key
+- `Duration` (rich text) — display string such as `1h 12m`
+- `Status` (status with `Open` / `Resolved`)
+- `Incident ID` (rich text) — used to upsert on re-runs
+
+Share both databases with the Notion integration used by `NOTION_API_TOKEN`.
 
 ## Primary-user mapping
 
@@ -146,15 +184,19 @@ checked-in, static mapping used by this project.
 
 ## Incident formatting
 
-Incidents are returned newest first and rendered under **High Urgency Paging**.
-Each bullet contains:
+Incidents are fetched for the Monday–Monday alert window and upserted into the
+shared incidents data source. Under **High Urgency Paging**, the page gets a
+linked table views that:
 
-- The incident creation time in `NOTION_TIMEZONE`.
-- A condensed title linked to PagerDuty.
-- The duration from creation to resolution, or to the current time if open.
+- Filter `Created` to the same alert window
+- Default to **By duration** (`Duration (minutes)` descending), with a second
+  **Chronological** view (`Created` descending) on the same linked database
+- Show only `Name`, `Created`, and `Duration` (other properties remain on the
+  incident page), with a wide wrapping Name column
 
-Long titles are limited to 100 characters. If no incidents occurred, the page
-contains a single “No high-urgency incidents in the past week” bullet.
+Long titles are limited to 60 characters for table readability. If no incidents
+occurred, the page contains a single “No high-urgency incidents in the past
+week” bullet instead of an empty linked view.
 
 ## Action carry-forward
 
@@ -195,7 +237,9 @@ Notion block helpers, and the main workflow without making external API calls.
 
 ## Current operational constraints
 
-- Re-running the command creates another page; it does not deduplicate by date.
+- Re-running the command for the same Monday updates that page: incident rows
+  are upserted, an existing High Urgency linked view is left in place, and
+  **Previous actions** is replaced from the prior handover.
 - A failure after page creation can leave a partially populated page.
 - Heading text and Notion property names must match the documented contract.
 - Transient API errors are not retried automatically.
@@ -223,7 +267,8 @@ Create a personal access token from the Notion developers portal:
 1. Open the [Notion developers portal](https://app.notion.com/developers).
 2. Go to the **Personal access tokens** tab.
 3. Click **+ New token**.
-4. Grant the token access to the handover database (and its template).
+4. Grant the token access to the handover database, its template, and the
+   high-urgency incidents database.
 5. Copy the token into `NOTION_API_TOKEN` in `.env`.
 
 The token only works for pages and databases you explicitly share with it.

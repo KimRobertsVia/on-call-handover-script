@@ -9,6 +9,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dotenv import load_dotenv
 
 DEFAULT_ALERTS_HEADING = "🚨 High Urgency Paging"
+DEFAULT_OUTAGES_HEADING = "🔥 Outages"
+DEFAULT_LOW_URGENCY_HEADING = "😴 Low Urgency Paging Events"
 DEFAULT_PREVIOUS_ACTIONS_HEADING = "🌝 Previous actions"
 DEFAULT_ACTIONS_HEADING = "🚀 Actions"
 
@@ -23,8 +25,11 @@ class Config:
     notion_token: str
     notion_data_source_id: str
     notion_template_id: str
+    notion_incidents_data_source_id: str
     pagerduty_primary_schedule_id: str
     notion_alerts_heading: str = DEFAULT_ALERTS_HEADING
+    notion_outages_heading: str = DEFAULT_OUTAGES_HEADING
+    notion_low_urgency_heading: str = DEFAULT_LOW_URGENCY_HEADING
     notion_previous_actions_heading: str = DEFAULT_PREVIOUS_ACTIONS_HEADING
     notion_actions_heading: str = DEFAULT_ACTIONS_HEADING
     notion_title_property: str = "Title"
@@ -67,6 +72,7 @@ class Config:
             "NOTION_API_TOKEN": "notion_token",
             "NOTION_DATA_SOURCE_ID": "notion_data_source_id",
             "NOTION_TEMPLATE_ID": "notion_template_id",
+            "NOTION_INCIDENTS_DATA_SOURCE_ID": "notion_incidents_data_source_id",
             "PAGERDUTY_PRIMARY_SCHEDULE_ID": "pagerduty_primary_schedule_id",
         }
         missing = [name for name in required if not values.get(name)]

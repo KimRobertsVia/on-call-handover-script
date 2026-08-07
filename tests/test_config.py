@@ -9,6 +9,7 @@ REQUIRED_ENV = {
     "NOTION_API_TOKEN": "notion-token",
     "NOTION_DATA_SOURCE_ID": "target",
     "NOTION_TEMPLATE_ID": "template",
+    "NOTION_INCIDENTS_DATA_SOURCE_ID": "incidents",
     "PAGERDUTY_PRIMARY_SCHEDULE_ID": "schedule",
 }
 
