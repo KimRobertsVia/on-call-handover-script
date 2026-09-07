@@ -21,7 +21,7 @@ from .blocks import (
 from .config import Config
 from .notion import NotionClient
 from .pagerduty import PagerDutyClient
-from .time_utils import alert_window, next_monday
+from .time_utils import alert_window, handover_monday
 from .users import load_user_map, mapped_notion_user_id
 
 logger = logging.getLogger(__name__)
@@ -54,7 +54,7 @@ class HandoverService:
     def run(self, *, now: datetime | None = None) -> HandoverResult:
         timezone = self._config.timezone
         now_local = now.astimezone(timezone) if now else datetime.now(timezone)
-        handover_date = next_monday(now_local.date())
+        handover_date = handover_monday(now_local, timezone)
         since, until = alert_window(handover_date, timezone)
 
         logger.info(

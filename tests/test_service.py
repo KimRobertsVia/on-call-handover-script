@@ -31,6 +31,7 @@ class FakeNotion:
         self.upserted: list[dict[str, Any]] = []
         self.linked_views: list[dict[str, Any]] = []
         self.created_pages = 0
+        self.created_handover_date: date | None = None
         self.templates_applied = 0
         self.existing_page = existing_page
         self._destination_blocks = destination_blocks
@@ -48,6 +49,7 @@ class FakeNotion:
     def create_page(self, **kwargs: Any) -> dict[str, str]:
         assert kwargs["now_primary_user_id"] is None
         self.created_pages += 1
+        self.created_handover_date = kwargs["handover_date"]
         return {"id": "destination", "url": "https://notion.test/destination"}
 
     def apply_template(self, page_id: str, **kwargs: Any) -> None:
@@ -143,12 +145,26 @@ def test_run_creates_page_when_none_exists_for_date(tmp_path: Path) -> None:
     assert result.incident_count == 0
     assert result.copied_action_count == 2
     assert notion.created_pages == 1
+    assert notion.created_handover_date == date(2026, 7, 27)
     assert notion.templates_applied == 1
     assert notion.deleted == ["alert-placeholder", "previous-placeholder"]
     assert len(notion.appended) == 2
     assert notion.appended[0]["children"][0]["type"] == "bulleted_list_item"
     assert notion.upserted == []
     assert notion.linked_views == []
+
+
+def test_run_after_monday_noon_targets_following_week(tmp_path: Path) -> None:
+    notion = FakeNotion()
+
+    HandoverService(
+        _config(tmp_path),
+        pagerduty=FakePagerDuty(),  # type: ignore[arg-type]
+        notion=notion,  # type: ignore[arg-type]
+        template_poll_interval=0,
+    ).run(now=datetime(2026, 7, 27, 11, 5, tzinfo=UTC))
+
+    assert notion.created_handover_date == date(2026, 8, 3)
 
 
 def test_run_upserts_incidents_and_creates_linked_view(tmp_path: Path) -> None:

@@ -5,7 +5,9 @@ incidents and outstanding actions from the previous handover.
 
 ## What it does
 
-For the current or upcoming Monday, the command:
+The command targets the next Monday 12:00 `Europe/London` (or
+`NOTION_TIMEZONE`) strictly after now. Before noon on Monday that is this
+week's page; at or after Monday 12:00 it is next week's page.
 
 1. Fetches high-urgency PagerDuty incidents from the previous Monday at 12:00
    through the handover Monday at 12:00.
@@ -240,6 +242,8 @@ Notion block helpers, and the main workflow without making external API calls.
 - Re-running the command for the same Monday updates that page: incident rows
   are upserted, an existing High Urgency linked view is left in place, and
   **Previous actions** is replaced from the prior handover.
+- A run at or after Monday 12:00 local time targets the **following** Monday,
+  not the page used in that morning's handover meeting.
 - A failure after page creation can leave a partially populated page.
 - Heading text and Notion property names must match the documented contract.
 - Transient API errors are not retried automatically.

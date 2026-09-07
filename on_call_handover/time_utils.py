@@ -2,9 +2,19 @@ from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 
-def next_monday(day: date) -> date:
-    days_ahead = -day.weekday() % 7
-    return day + timedelta(days=days_ahead)
+def handover_monday(now: datetime, timezone: ZoneInfo) -> date:
+    """Return the Monday whose 12:00 local cutoff is next after ``now``.
+
+    If ``now`` is already at or after that week's Monday 12:00, the following
+    Monday is used. A Monday 11:20 run therefore targets this week's page; a
+    Monday 12:05 run targets next week.
+    """
+    now_local = now.astimezone(timezone)
+    week_monday = now_local.date() - timedelta(days=now_local.weekday())
+    cutoff = datetime.combine(week_monday, time(12), tzinfo=timezone)
+    if now_local < cutoff:
+        return week_monday
+    return week_monday + timedelta(days=7)
 
 
 def alert_window(
