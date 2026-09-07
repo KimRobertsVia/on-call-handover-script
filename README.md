@@ -192,7 +192,7 @@ linked table views that:
 
 - Filter `Created` to the same alert window
 - Default to **By duration** (`Duration (minutes)` descending), with a second
-  **Chronological** view (`Created` descending) on the same linked database
+  **Chronological** view (`Created` ascending) on the same linked database
 - Show only `Name`, `Created`, and `Duration` (other properties remain on the
   incident page), with a wide wrapping Name column
 

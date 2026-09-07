@@ -311,7 +311,7 @@ class NotionClient:
                 "sorts": [
                     {
                         "property": "Created",
-                        "direction": "descending",
+                        "direction": "ascending",
                     }
                 ],
                 "configuration": {
