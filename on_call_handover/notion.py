@@ -45,23 +45,6 @@ class NotionClient:
         }
         self._property_ids_by_data_source: dict[str, dict[str, str]] = {}
 
-    def acting_user(self) -> dict[str, str]:
-        user = self._request("GET", "/users/me")
-        if user.get("type") == "person":
-            return {"id": user["id"], "name": user.get("name") or user["id"]}
-
-        owner = (user.get("bot") or {}).get("owner") or {}
-        if owner.get("type") == "user":
-            owner_user = owner.get("user") or {}
-            if owner_user.get("id"):
-                return {
-                    "id": owner_user["id"],
-                    "name": owner_user.get("name") or owner_user["id"],
-                }
-        raise RuntimeError(
-            "Could not resolve a Notion person for Created By from users/me"
-        )
-
     def people_by_email(self, data_source_ids: list[str]) -> dict[str, dict[str, str]]:
         people: dict[str, dict[str, str]] = {}
         for data_source_id in data_source_ids:
@@ -166,7 +149,7 @@ class NotionClient:
         title_property: str,
         title: str,
         handover_date: date,
-        created_by_user_id: str,
+        created_by_user_id: str | None,
         now_primary_user_id: str | None,
     ) -> dict[str, Any]:
         properties: dict[str, Any] = {
@@ -174,8 +157,9 @@ class NotionClient:
                 "title": [{"type": "text", "text": {"content": title}}],
             },
             "Date": {"date": {"start": handover_date.isoformat()}},
-            "Created By": {"people": [{"id": created_by_user_id}]},
         }
+        if created_by_user_id:
+            properties["Created By"] = {"people": [{"id": created_by_user_id}]}
         if now_primary_user_id:
             properties["Now Primary"] = {"people": [{"id": now_primary_user_id}]}
 

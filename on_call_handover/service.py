@@ -75,15 +75,18 @@ class HandoverService:
             logger.info("Updating existing handover page %s", page_id)
             blocks = self._notion.block_children(page_id)
         else:
+            created_by_user_id = self._resolve_notion_user_id(
+                now_local,
+                role="Created By",
+            )
             primary_user_id = self._resolve_primary_user_id(handover_date)
-            actor = self._notion.acting_user()
             title = f"On-call Handover {handover_date.isoformat()}"
             page = self._notion.create_page(
                 data_source_id=self._config.notion_data_source_id,
                 title_property=self._config.notion_title_property,
                 title=title,
                 handover_date=handover_date,
-                created_by_user_id=actor["id"],
+                created_by_user_id=created_by_user_id,
                 now_primary_user_id=primary_user_id,
             )
             page_id = page["id"]
@@ -121,10 +124,23 @@ class HandoverService:
             datetime_time(12),
             tzinfo=timezone,
         )
-        pagerduty_user = self._pagerduty.primary_oncall(
-            schedule_id=self._config.pagerduty_primary_schedule_id,
-            at=shift_start,
-        )
+        return self._resolve_notion_user_id(shift_start, role="Now Primary")
+
+    def _resolve_notion_user_id(
+        self,
+        at: datetime,
+        *,
+        role: str,
+    ) -> str | None:
+        try:
+            pagerduty_user = self._pagerduty.primary_oncall(
+                schedule_id=self._config.pagerduty_primary_schedule_id,
+                at=at,
+            )
+        except Exception as exc:
+            logger.warning("Could not resolve %s from PagerDuty: %s", role, exc)
+            return None
+
         user_map = load_user_map(self._config.user_map_path)
         user_id = mapped_notion_user_id(
             user_map,
@@ -132,18 +148,34 @@ class HandoverService:
             pagerduty_name=pagerduty_user["name"],
         )
         if user_id:
-            logger.info("Resolved Now Primary from user map")
+            logger.info("Resolved %s from user map", role)
             return user_id
 
-        people = self._notion.people_by_email([self._config.notion_data_source_id])
+        try:
+            people = self._notion.people_by_email(
+                [self._config.notion_data_source_id]
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not resolve %s from existing handover pages: %s",
+                role,
+                exc,
+            )
+            return None
+
         person = people.get(pagerduty_user["email"].lower())
         if person:
-            logger.info("Resolved Now Primary from existing handover pages")
+            logger.info("Resolved %s from existing handover pages", role)
             return person["id"]
-        raise RuntimeError(
-            "No Notion user mapping for the PagerDuty primary. "
-            "Add their PagerDuty email or name to user_map.json."
+
+        logger.warning(
+            "No Notion user mapping for %s (%s / %s); leaving unset. "
+            "Add their PagerDuty email or name to user_map.json.",
+            role,
+            pagerduty_user["email"],
+            pagerduty_user["name"],
         )
+        return None
 
     def _wait_for_template(self, page_id: str) -> list[dict[str, Any]]:
         deadline = time.monotonic() + self._template_timeout

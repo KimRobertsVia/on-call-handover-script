@@ -11,8 +11,10 @@ week's page; at or after Monday 12:00 it is next week's page.
 
 1. Fetches high-urgency PagerDuty incidents from the previous Monday at 12:00
    through the handover Monday at 12:00.
-2. Optionally resolves the scheduled primary on-call person to a Notion user.
-3. Creates a Notion page with its title, date, creator, and optional primary.
+2. Resolves the current PagerDuty on-call person to a Notion user for
+   **Created By**, and optionally the Monday 12:00 primary for **Now Primary**.
+3. Creates a Notion page with its title, date, optional creator, and optional
+   primary.
 4. Applies the configured Notion template and validates its expected headings.
 5. Upserts each incident into the shared high-urgency incidents data source and
    inserts a linked database under **High Urgency Paging** with **By duration**
@@ -124,11 +126,12 @@ The handover data source must contain:
 - `Title` as a title property, or the name configured by
   `NOTION_TITLE_PROPERTY`.
 - `Date` as a date property.
-- `Created By` as a people property.
-- `Now Primary` as a people property when primary mentions are enabled.
+- `Created By` as a people property (current on-call; left unset if unmapped).
+- `Now Primary` as a people property when primary mentions are enabled
+  (Monday 12:00 on-call; left unset if unmapped).
 
 People properties on existing handover pages may be used as a fallback when
-resolving a primary user by email.
+resolving an on-call user by email.
 
 The template is applied after page creation using `erase_content=true`. This is
 intentional: applying it in the create request can produce a blank page in the
@@ -156,17 +159,21 @@ The incidents data source (`NOTION_INCIDENTS_DATA_SOURCE_ID`) must contain:
 
 Share both databases with the Notion integration used by `NOTION_API_TOKEN`.
 
-## Primary-user mapping
+## On-call user mapping
 
-Primary resolution is skipped entirely unless `MENTION_NOW_PRIMARY=true`.
-When enabled, the command:
+**Created By** always tries to resolve the level-one PagerDuty on-call at run
+time (`now`). **Now Primary** is resolved only when `MENTION_NOW_PRIMARY=true`,
+using the level-one on-call at Monday 12:00 local time.
 
-1. Gets the level-one PagerDuty on-call user at Monday 12:00 local time.
+For each role, the command:
+
+1. Looks up the PagerDuty on-call user at the relevant time.
 2. Looks in `user_map.json` by PagerDuty email, then by PagerDuty name.
 3. Falls back to an exact email match among people found on existing handovers.
 
-Notion's workspace-wide `/v1/users` endpoint is not called because it is not
-available to the current token.
+If PagerDuty lookup or Notion mapping fails, that people property is left unset
+and page creation continues. Notion's workspace-wide `/v1/users` endpoint is not
+called because it is not available to the current token.
 
 The map has this shape:
 

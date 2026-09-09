@@ -7,16 +7,31 @@ from on_call_handover.service import HandoverService
 
 
 class FakePagerDuty:
-    def __init__(self, incidents: list[dict[str, Any]] | None = None) -> None:
-        self.primary_calls = 0
+    def __init__(
+        self,
+        incidents: list[dict[str, Any]] | None = None,
+        *,
+        oncall: dict[str, str] | None = None,
+        oncall_by_at: dict[datetime, dict[str, str]] | None = None,
+    ) -> None:
+        self.primary_calls: list[datetime] = []
         self.incidents = incidents or []
+        self.oncall = oncall or {
+            "id": "PD1",
+            "name": "Current Person",
+            "email": "current@example.com",
+        }
+        self.oncall_by_at = oncall_by_at or {}
 
     def high_urgency_incidents(self, since: datetime, until: datetime) -> list[dict]:
         return self.incidents
 
     def primary_oncall(self, **kwargs: Any) -> dict[str, str]:
-        self.primary_calls += 1
-        raise AssertionError("Primary on-call should not be resolved when disabled")
+        at = kwargs["at"]
+        self.primary_calls.append(at)
+        if at in self.oncall_by_at:
+            return self.oncall_by_at[at]
+        return self.oncall
 
 
 class FakeNotion:
@@ -32,12 +47,14 @@ class FakeNotion:
         self.linked_views: list[dict[str, Any]] = []
         self.created_pages = 0
         self.created_handover_date: date | None = None
+        self.created_by_user_id: str | None = None
+        self.now_primary_user_id: str | None = None
         self.templates_applied = 0
         self.existing_page = existing_page
         self._destination_blocks = destination_blocks
 
-    def acting_user(self) -> dict[str, str]:
-        return {"id": "actor", "name": "Actor"}
+    def people_by_email(self, data_source_ids: list[str]) -> dict[str, dict[str, str]]:
+        return {}
 
     def page_by_date(
         self,
@@ -47,9 +64,10 @@ class FakeNotion:
         return self.existing_page
 
     def create_page(self, **kwargs: Any) -> dict[str, str]:
-        assert kwargs["now_primary_user_id"] is None
         self.created_pages += 1
         self.created_handover_date = kwargs["handover_date"]
+        self.created_by_user_id = kwargs["created_by_user_id"]
+        self.now_primary_user_id = kwargs["now_primary_user_id"]
         return {"id": "destination", "url": "https://notion.test/destination"}
 
     def apply_template(self, page_id: str, **kwargs: Any) -> None:
@@ -111,7 +129,7 @@ class FakeNotion:
         return {"id": "view"}
 
 
-def _config(tmp_path: Path) -> Config:
+def _config(tmp_path: Path, *, mention_now_primary: bool = False) -> Config:
     return Config(
         pagerduty_token="pd",
         notion_token="notion",
@@ -124,8 +142,16 @@ def _config(tmp_path: Path) -> Config:
         notion_low_urgency_heading="😴 Low Urgency Paging Events",
         notion_previous_actions_heading="Previous",
         notion_actions_heading="Actions",
-        mention_now_primary=False,
+        mention_now_primary=mention_now_primary,
         user_map_path=tmp_path / "user_map.json",
+    )
+
+
+def _write_user_map(tmp_path: Path, email: str, notion_user_id: str) -> None:
+    (tmp_path / "user_map.json").write_text(
+        '{"by_pagerduty_email": {"%s": "%s"}, "by_pagerduty_name": {}}'
+        % (email, notion_user_id),
+        encoding="utf-8",
     )
 
 
@@ -140,18 +166,89 @@ def test_run_creates_page_when_none_exists_for_date(tmp_path: Path) -> None:
         template_poll_interval=0,
     ).run(now=datetime(2026, 7, 27, 9, tzinfo=UTC))
 
-    assert pagerduty.primary_calls == 0
+    assert len(pagerduty.primary_calls) == 1
     assert result.created is True
     assert result.incident_count == 0
     assert result.copied_action_count == 2
     assert notion.created_pages == 1
     assert notion.created_handover_date == date(2026, 7, 27)
+    assert notion.created_by_user_id is None
+    assert notion.now_primary_user_id is None
     assert notion.templates_applied == 1
     assert notion.deleted == ["alert-placeholder", "previous-placeholder"]
     assert len(notion.appended) == 2
     assert notion.appended[0]["children"][0]["type"] == "bulleted_list_item"
     assert notion.upserted == []
     assert notion.linked_views == []
+
+
+def test_run_sets_created_by_from_current_oncall(tmp_path: Path) -> None:
+    _write_user_map(tmp_path, "current@example.com", "notion-current")
+    pagerduty = FakePagerDuty()
+    notion = FakeNotion()
+
+    HandoverService(
+        _config(tmp_path),
+        pagerduty=pagerduty,  # type: ignore[arg-type]
+        notion=notion,  # type: ignore[arg-type]
+        template_poll_interval=0,
+    ).run(now=datetime(2026, 7, 27, 9, tzinfo=UTC))
+
+    assert notion.created_by_user_id == "notion-current"
+    assert notion.now_primary_user_id is None
+    assert len(pagerduty.primary_calls) == 1
+    assert pagerduty.primary_calls[0].isoformat() == "2026-07-27T10:00:00+01:00"
+
+
+def test_run_sets_now_primary_from_monday_noon_oncall(tmp_path: Path) -> None:
+    _write_user_map(tmp_path, "next@example.com", "notion-next")
+    now = datetime(2026, 7, 27, 9, tzinfo=UTC)
+    monday_noon = datetime.fromisoformat("2026-07-27T12:00:00+01:00")
+    pagerduty = FakePagerDuty(
+        oncall={
+            "id": "PD1",
+            "name": "Current Person",
+            "email": "current@example.com",
+        },
+        oncall_by_at={
+            monday_noon: {
+                "id": "PD2",
+                "name": "Next Person",
+                "email": "next@example.com",
+            }
+        },
+    )
+    notion = FakeNotion()
+
+    HandoverService(
+        _config(tmp_path, mention_now_primary=True),
+        pagerduty=pagerduty,  # type: ignore[arg-type]
+        notion=notion,  # type: ignore[arg-type]
+        template_poll_interval=0,
+    ).run(now=now)
+
+    assert notion.created_by_user_id is None
+    assert notion.now_primary_user_id == "notion-next"
+    assert len(pagerduty.primary_calls) == 2
+
+
+def test_run_leaves_people_unset_when_mapping_missing(tmp_path: Path) -> None:
+    (tmp_path / "user_map.json").write_text(
+        '{"by_pagerduty_email": {}, "by_pagerduty_name": {}}',
+        encoding="utf-8",
+    )
+    notion = FakeNotion()
+
+    HandoverService(
+        _config(tmp_path, mention_now_primary=True),
+        pagerduty=FakePagerDuty(),  # type: ignore[arg-type]
+        notion=notion,  # type: ignore[arg-type]
+        template_poll_interval=0,
+    ).run(now=datetime(2026, 7, 27, 9, tzinfo=UTC))
+
+    assert notion.created_pages == 1
+    assert notion.created_by_user_id is None
+    assert notion.now_primary_user_id is None
 
 
 def test_run_after_monday_noon_targets_following_week(tmp_path: Path) -> None:
@@ -256,6 +353,7 @@ def test_run_updates_existing_page_without_recreating_view(tmp_path: Path) -> No
     assert len(notion.appended) == 1
     assert notion.appended[0]["after_block_id"] == "previous"
     assert result.copied_action_count == 2
+    assert pagerduty.primary_calls == []
 
 
 def _heading(block_id: str, text: str) -> dict[str, Any]:
