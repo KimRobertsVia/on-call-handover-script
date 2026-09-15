@@ -4,7 +4,6 @@ import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
-from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
@@ -267,42 +266,6 @@ def incident_notion_properties(
         }
 
     return properties
-
-
-def incident_bullet(
-    incident: dict[str, Any],
-    timezone: ZoneInfo,
-) -> dict[str, Any]:
-    title = incident.get("title") or incident.get("summary") or "(untitled)"
-    rich_text: list[dict[str, Any]] = []
-    if incident.get("created_at"):
-        created = _parse_datetime(incident["created_at"]).astimezone(timezone)
-        rich_text.extend(
-            [
-                {
-                    "type": "mention",
-                    "mention": {
-                        "type": "date",
-                        "date": {"start": created.isoformat()},
-                    },
-                },
-                _plain_text(" - "),
-            ]
-        )
-
-    title_text: dict[str, Any] = {"content": condense_incident_title(title)}
-    if incident.get("html_url"):
-        title_text["link"] = {"url": incident["html_url"]}
-    rich_text.append({"type": "text", "text": title_text})
-
-    duration = incident_duration(incident)
-    if duration:
-        rich_text.append(_plain_text(f" ({duration})"))
-    return {
-        "object": "block",
-        "type": "bulleted_list_item",
-        "bulleted_list_item": {"rich_text": rich_text},
-    }
 
 
 def no_incidents_bullet() -> dict[str, Any]:

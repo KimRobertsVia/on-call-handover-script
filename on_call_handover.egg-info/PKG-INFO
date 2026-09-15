@@ -1,9 +1,0 @@
-Metadata-Version: 2.4
-Name: on-call-handover
-Version: 0.1.0
-Summary: Create weekly Notion handover pages from PagerDuty incidents
-Requires-Python: >=3.11
-Requires-Dist: python-dotenv>=1.0.0
-Requires-Dist: requests>=2.31.0
-Provides-Extra: test
-Requires-Dist: pytest>=8; extra == "test"
